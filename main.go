@@ -118,19 +118,16 @@ func commandListener(event *events.ApplicationCommandInteractionCreate) {
 			return
 		}
 
-		if stderr, err := cmd.StderrPipe(); err != nil {
+		stderr, err := cmd.StderrPipe()
+
+		if err != nil {
 			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while downloading media\n" + err.Error()})
 			return
-		} else {
-			go io.Copy(os.Stderr, stderr)
 		}
+
+		go io.Copy(os.Stderr, stderr)
 
 		if err = cmd.Start(); err != nil {
-			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while downloading media\n" + err.Error()})
-			return
-		}
-
-		if err = cmd.Wait(); err != nil {
 			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while downloading media\n" + err.Error()})
 			return
 		}
