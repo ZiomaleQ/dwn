@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -13,20 +16,41 @@ import (
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
-	"github.com/lrstanley/go-ytdlp"
 )
 
 var UrlRegex = regexp.MustCompile(`https?:\/\/\S+\.+[a-z]{2,6}/[^>\s]*`)
+var BotToken string
+var YTDLPPath string
 
-var BotToken = os.Getenv("DISCORD_BOT_TOKEN")
 var BotCommands = []discord.ApplicationCommandCreate{
 	discord.MessageCommandCreate{
 		Name: "Download media",
+		Contexts: []discord.InteractionContextType{
+			discord.InteractionContextTypeGuild,
+			discord.InteractionContextTypeBotDM,
+			discord.InteractionContextTypePrivateChannel,
+		},
+		IntegrationTypes: []discord.ApplicationIntegrationType{
+			discord.ApplicationIntegrationTypeGuildInstall,
+			discord.ApplicationIntegrationTypeUserInstall,
+		},
 	},
 }
 
 func main() {
-	ytdlp.MustInstall(context.TODO(), nil)
+	if len(os.Args) > 2 {
+		config, err := ReadConfig(os.Args[1])
+
+		if err != nil {
+			panic(err)
+		}
+
+		BotToken = config.Token
+		YTDLPPath = config.YtDlp
+	} else {
+		BotToken = os.Getenv("DISCORD_BOT_TOKEN")
+		YTDLPPath = os.Getenv("YTDLP_PATH")
+	}
 
 	client, err := disgo.New(BotToken,
 		bot.WithDefaultGateway(),
@@ -68,70 +92,117 @@ func commandListener(event *events.ApplicationCommandInteractionCreate) {
 
 		event.DeferCreateMessage(false)
 
+		var mediaInfo MediaInfo
+
+		if rawMediaInfo, err := GetInfo(matches); err != nil {
+			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while reading media info\n" + err.Error()})
+			return
+		} else {
+
+			if rawMediaInfo.Ext == "opus" {
+				rawMediaInfo.Ext = "ogg"
+			}
+
+			mediaInfo = *rawMediaInfo
+		}
+
 		cmd := exec.Cmd{
-			// Path: os.Getenv("YTDL_PATH"),
-			Path: `C:\PathExposed\yt-dlp.exe`,
-			Args: []string{matches, "-o -"},
+			Path: YTDLPPath,
+			Args: []string{YTDLPPath, "-o", "-", "-S", "res:720,filesize~20M", matches},
 		}
 
 		pipe, err := cmd.StdoutPipe()
 
 		if err != nil {
-			event.CreateMessage(discord.MessageCreate{
-				Content: "Error while reading media file\n" + err.Error(),
-			})
+			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while downloading media\n" + err.Error()})
 			return
 		}
 
-		stderr, err := cmd.StderrPipe()
+		if stderr, err := cmd.StderrPipe(); err != nil {
+			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while downloading media\n" + err.Error()})
+			return
+		} else {
+			go io.Copy(os.Stderr, stderr)
+		}
 
-		if err != nil {
-			event.CreateMessage(discord.MessageCreate{
-				Content: "Error while reading media file\n" + err.Error(),
-			})
+		if err = cmd.Start(); err != nil {
+			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while downloading media\n" + err.Error()})
 			return
 		}
 
-		err = cmd.Start()
-
-		if err != nil {
-			event.CreateMessage(discord.MessageCreate{
-				Content: "Error while downloading media\n" + err.Error(),
-				Flags:   discord.MessageFlagEphemeral,
-			})
+		if err = cmd.Wait(); err != nil {
+			CreateFollowupMessage(event, discord.MessageCreate{Content: "Error while downloading media\n" + err.Error()})
 			return
 		}
 
-		go func() {
-			buf := make([]byte, 1024)
-			for {
-				n, err := stderr.Read(buf)
-				if err != nil {
-					break
-				}
-				slog.Info(string(buf[:n]))
-			}
-		}()
-
-		go func() {
-			buf := make([]byte, 1024)
-			for {
-				n, err := pipe.Read(buf)
-				if err != nil {
-					break
-				}
-				slog.Info(string(buf[:n]))
-			}
-		}()
-
-		event.CreateMessage(discord.MessageCreate{
-			Content: "Downloaded media",
-			// Files: []*discord.File{
-			// 	{
-			// 		Name:   "funny_video.mp4",
-			// 		Reader: pipe,
-			// 	},
-			// },
-		})
+		event.Client().Rest().CreateFollowupMessage(event.ApplicationID(), event.Token(),
+			discord.MessageCreate{
+				Files: []*discord.File{
+					{
+						Name:   fmt.Sprintf("%s.%s", mediaInfo.DisplayID, mediaInfo.Ext),
+						Reader: pipe,
+					},
+				},
+			})
 	}
+}
+
+type MediaInfo struct {
+	Ext       string
+	DisplayID string `json:"display_id"`
+}
+
+func GetInfo(url string) (*MediaInfo, error) {
+
+	cmd := exec.Cmd{
+		Path: YTDLPPath,
+		Args: []string{YTDLPPath, "-J", "-S", "res:720,filesize~20M", url},
+	}
+
+	var info MediaInfo
+
+	data, err := cmd.Output()
+
+	if err != nil {
+		return nil, err
+	}
+
+	json.Unmarshal(data, &info)
+
+	return &info, nil
+}
+
+func CreateFollowupMessage(event *events.ApplicationCommandInteractionCreate, message discord.MessageCreate) error {
+	_, err := event.Client().Rest().CreateFollowupMessage(event.ApplicationID(), event.Token(), message)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type Config struct {
+	Token string `json:"DISCORD_BOT_TOKEN"`
+	YtDlp string `json:"YTDLP_PATH"`
+}
+
+func ReadConfig(path string) (*Config, error) {
+	var config Config
+
+	configFile := os.Args[1]
+
+	data, err := os.ReadFile(configFile)
+
+	if err != nil {
+		slog.Error("error while reading config file", slog.Any("err", err))
+		return nil, err
+	}
+
+	if err = json.Unmarshal(data, &config); err != nil {
+		slog.Error("error while unmarshalling config file", slog.Any("err", err))
+		return nil, err
+	}
+
+	return &config, nil
 }
